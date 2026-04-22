@@ -19,7 +19,9 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.flexiv_policy as flexiv_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.piper_policy as piper_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -463,6 +465,114 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotFlexivDataConfig(DataConfigFactory):
+    """Data config for Flexiv LeRobot datasets (e.g. ``datasets/stack_cubes_30``).
+
+    Dataset features (see ``meta/info.json``):
+      - ``observation.state`` / ``action``: 7-D (xyz + rxyz + gripper)
+      - ``observation.images.primary``, ``observation.images.wrist``
+
+    Actions are absolute end-effector poses, so we apply a delta transform on the
+    first 6 dims (pose) and keep the gripper dim absolute. Disable via
+    ``use_delta_actions=False`` if your data is already in delta space.
+    """
+
+    use_delta_actions: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.primary",
+                        "observation/wrist_image": "observation.images.wrist",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[flexiv_policy.FlexivInputs(model_type=model_config.model_type)],
+            outputs=[flexiv_policy.FlexivOutputs()],
+        )
+
+        if self.use_delta_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotPiperDataConfig(DataConfigFactory):
+    """Data config for Piper LeRobot datasets (e.g. ``datasets/stack_cubes``).
+
+    Dataset features (see ``meta/info.json``):
+      - ``observation.state`` / ``action``: 7-D (``main_joint_1..6`` + ``main_gripper``)
+      - ``observation.images.primary``, ``observation.images.wrist``
+
+    Actions are absolute joint targets. 关节空间下默认不做 delta 化；如果你的数据
+    已经是相对量或希望学习增量，可设置 ``use_delta_actions=True`` 对前 6 维关节做
+    delta，夹爪保持绝对。
+    """
+
+    use_delta_actions: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.primary",
+                        "observation/wrist_image": "observation.images.wrist",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[piper_policy.PiperInputs(model_type=model_config.model_type)],
+            outputs=[piper_policy.PiperOutputs()],
+        )
+
+        if self.use_delta_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -760,6 +870,166 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    #
+    # Fine-tuning Flexiv configs (e.g. ``datasets/stack_cubes_30``).
+    #
+    # The dataset is a LeRobot v2.1 dataset with 7-D state/action and two cameras
+    # (``primary`` + ``wrist``). To train locally, set ``LEROBOT_HOME`` so that
+    # ``$LEROBOT_HOME/<repo_id>`` resolves to the dataset directory, e.g.::
+    #
+    #     export LEROBOT_HOME=/mnt/lx/cyx/openpi/datasets
+    #     uv run scripts/compute_norm_stats.py --config-name=pi0_flexiv_stack_cubes
+    #     uv run scripts/train.py pi0_flexiv_stack_cubes --exp-name=my_run
+    TrainConfig(
+        name="pi0_flexiv_stack_cubes",
+        model=pi0_config.Pi0Config(action_horizon=20),
+        data=LeRobotFlexivDataConfig(
+            repo_id="/mnt/lx/cyx/openpi/datasets/stack_cubes_30",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        batch_size=4,
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_fast_flexiv_stack_cubes",
+        model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=10, max_token_len=180),
+        data=LeRobotFlexivDataConfig(
+            repo_id="stack_cubes_30",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_flexiv_stack_cubes_low_mem_finetune",
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotFlexivDataConfig(
+            repo_id="stack_cubes_30",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=2_000,
+            peak_lr=1e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=0.5),
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_flexiv_stack_cubes_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotFlexivDataConfig(
+            repo_id="/mnt/lx/cyx/openpi/datasets/stack_cubes_30",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=64,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        log_interval=20,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=2_000,
+            peak_lr=1e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=0.5),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
+    # Fine-tuning Piper configs (e.g. ``datasets/stack_cubes``).
+    #
+    # 数据集为 LeRobot v2.1 格式，7 维 joint+gripper 的 state/action，两路相机
+    # (``primary`` + ``wrist``)。本地训练前先设置 ``LEROBOT_HOME``，使得
+    # ``$LEROBOT_HOME/<repo_id>`` 指向数据集目录，例如::
+    #
+    #     export LEROBOT_HOME=/mnt/lx/cyx/openpi/datasets
+    #     uv run scripts/compute_norm_stats.py --config-name=pi0_piper_stack_cubes
+    #     uv run scripts/train.py pi0_piper_stack_cubes --exp-name=my_run
+    TrainConfig(
+        name="pi0_piper_stack_cubes",
+        model=pi0_config.Pi0Config(action_horizon=20),
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/lx/cyx/openpi/datasets/stack_cubes",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        # batch_size 必须被设备数（此机 8 卡）整除；显存不够可降到 8/16 并相应减少 GPU。
+        batch_size=32,
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_fast_piper_stack_cubes",
+        model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=10, max_token_len=180),
+        data=LeRobotPiperDataConfig(
+            repo_id="stack_cubes",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_piper_stack_cubes_low_mem_finetune",
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotPiperDataConfig(
+            repo_id="stack_cubes",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=2_000,
+            peak_lr=1e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=0.5),
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_piper_stack_cubes_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/lx/cyx/openpi/datasets/stack_cubes",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=64,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        log_interval=20,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
     ),
     #
     # Fine-tuning Aloha configs.

@@ -62,6 +62,80 @@ class TransformedDataset(Dataset[T_co]):
         return len(self._dataset)
 
 
+class EpisodeAwareHorizonDataset(Dataset[T_co]):
+    """过滤掉每个 episode 末尾不足 ``action_horizon`` 长的样本。
+
+    LeRobot 的 ``delta_timestamps`` 会按 ``[t, t+1/fps, ..., t+(H-1)/fps]`` 请求视频帧。
+    当某个样本位于 episode 末尾、剩余帧数不足 ``H`` 时，请求会越过最后一帧导致
+    ``torchcodec`` 报越界 / ``pyav`` 报 ``tolerance_s`` 断言失败。
+
+    这里直接从 ``episode_data_index`` 构造一份「合法索引」表，保证：
+
+    - 每个合法样本被等概率采样，不会引入分布偏差；
+    - ``__len__`` 真实反映可训练帧数，训练/eval 不会因坏样本崩溃。
+
+    对其它极少数偶发解码异常（如个别视频帧损坏），保留一个小范围的重试兜底，
+    用另一个随机合法索引替换；这种情况若发生会打印 warning。
+    """
+
+    def __init__(self, dataset, action_horizon: int, max_retries: int = 8):
+        self._dataset = dataset
+        self._max_retries = max_retries
+        self._rng = np.random.default_rng(0)
+        self._logged_bad: set[int] = set()
+
+        ep_from = np.asarray(dataset.episode_data_index["from"]).astype(np.int64)
+        ep_to = np.asarray(dataset.episode_data_index["to"]).astype(np.int64)
+        # 样本 i 访问帧 [i, i+H-1]，需全部落在 [from, to)，因此合法局部索引为
+        # [from, to - H]（闭区间）。当 episode 长度 < H 时该 episode 被整体丢弃。
+        valid: list[np.ndarray] = []
+        for lo, hi in zip(ep_from, ep_to, strict=True):
+            last = hi - action_horizon
+            if last >= lo:
+                valid.append(np.arange(lo, last + 1, dtype=np.int64))
+        if not valid:
+            raise ValueError(
+                f"EpisodeAwareHorizonDataset: no episode长度 ≥ action_horizon={action_horizon}"
+            )
+        self._valid_indices = np.concatenate(valid)
+
+        dropped = len(dataset) - len(self._valid_indices)
+        if dropped > 0:
+            logging.info(
+                "EpisodeAwareHorizonDataset: dropped %d/%d tail frames (action_horizon=%d)",
+                dropped,
+                len(dataset),
+                action_horizon,
+            )
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        idx = int(index)
+        last_err: Exception | None = None
+        for attempt in range(self._max_retries):
+            global_idx = int(self._valid_indices[idx])
+            try:
+                return self._dataset[global_idx]
+            except (AssertionError, RuntimeError, IndexError) as e:
+                last_err = e
+                if global_idx not in self._logged_bad:
+                    self._logged_bad.add(global_idx)
+                    logging.warning(
+                        "EpisodeAwareHorizonDataset: fallback on rare decode error at "
+                        "global_idx=%d (attempt %d/%d): %s",
+                        global_idx,
+                        attempt + 1,
+                        self._max_retries,
+                        str(e).splitlines()[0] if str(e) else type(e).__name__,
+                    )
+                idx = int(self._rng.integers(0, len(self._valid_indices)))
+        raise RuntimeError(
+            f"EpisodeAwareHorizonDataset: failed after {self._max_retries} retries"
+        ) from last_err
+
+    def __len__(self) -> int:
+        return len(self._valid_indices)
+
+
 class IterableTransformedDataset(IterableDataset[T_co]):
     def __init__(
         self,
@@ -144,6 +218,11 @@ def create_torch_dataset(
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+
+    # 某些 episode 末尾剩余帧数不足 action_horizon，LeRobot 的 delta_timestamps 会请求
+    # 越过视频末帧的时间戳（torchcodec 抛 numFrames 越界、pyav 抛 tolerance_s 断言）。
+    # 这里直接按 episode 长度过滤掉这些无效起始索引，保证采样分布不偏移。
+    dataset = EpisodeAwareHorizonDataset(dataset, action_horizon=action_horizon)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
