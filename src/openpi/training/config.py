@@ -1031,6 +1031,31 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
+
+    TrainConfig(
+        name='pi05_piper_3in1',
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/lx/cyx/openpi/datasets/piper_3in1",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=64,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        log_interval=20,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
     #
     # Fine-tuning Aloha configs.
     #
