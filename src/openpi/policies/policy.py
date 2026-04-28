@@ -15,6 +15,7 @@ from typing_extensions import override
 
 from openpi import transforms as _transforms
 from openpi.models import model as _model
+from openpi.policies.spec_decode import SpecConfig, SpeculativeDecoder, build_sampler
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
 
@@ -33,6 +34,7 @@ class Policy(BasePolicy):
         metadata: dict[str, Any] | None = None,
         pytorch_device: str = "cpu",
         is_pytorch: bool = False,
+        spec_config: SpecConfig | None = None,
     ):
         """Initialize the Policy.
 
@@ -46,6 +48,9 @@ class Policy(BasePolicy):
             pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda:0").
                           Only relevant when is_pytorch=True.
             is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
+            spec_config: Speculative decoding configuration. Enable via
+                ``spec_config.enable_speculative``. Supported for both JAX and
+                PyTorch backends.
         """
         self._model = model
         self._input_transform = _transforms.compose(transforms)
@@ -54,6 +59,9 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+
+        self._spec_config = spec_config
+        self._spec_decoder: SpeculativeDecoder | None = None
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -64,6 +72,34 @@ class Policy(BasePolicy):
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
 
+        if spec_config is not None and spec_config.enable_speculative:
+            sampler = build_sampler(self._model, is_pytorch=is_pytorch)
+            self._spec_decoder = SpeculativeDecoder(sampler, spec_config)
+            logging.info(
+                "Speculative decoding ENABLED (backend=%s, spec_batch_size=%d, "
+                "spec_diffusion_num_steps=%s, delta=%s, verify_conf=%s, verify_seq=%s)",
+                "pytorch" if is_pytorch else "jax",
+                spec_config.spec_batch_size,
+                spec_config.spec_diffusion_num_steps,
+                (
+                    list(spec_config.spec_delta_thresholds)
+                    if spec_config.spec_delta_thresholds is not None
+                    else spec_config.spec_delta_threshold
+                ),
+                spec_config.spec_verify_conf,
+                spec_config.spec_verify_seq,
+            )
+
+    # ---------- helpers ----------
+    def _output_transform_single_sample(self, sample: dict) -> dict:
+        """Apply the full output transform pipeline to a *single* sample dict.
+
+        ``sample`` is a numpy dict ``{"actions": (H, D), "state": (D_s,)}``; the
+        returned dict contains the same keys after un-normalize / repack.
+        """
+        return self._output_transform({k: np.asarray(v) for k, v in sample.items()})
+
+    # ---------- infer ----------
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
@@ -78,16 +114,29 @@ class Policy(BasePolicy):
             inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
 
-        # Prepare kwargs for sample_actions
+        observation = _model.Observation.from_dict(inputs)
+
+        # --------------- speculative decoding path ---------------
+        if self._spec_decoder is not None:
+            if noise is not None:
+                raise ValueError("Speculative decoding does not accept externally-provided noise.")
+            start_time = time.monotonic()
+            spec_out = self._spec_decoder.decode(
+                observation,
+                output_transform_sample_fn=self._output_transform_single_sample,
+            )
+            model_time = time.monotonic() - start_time
+            spec_out["policy_timing"] = {"infer_ms": model_time * 1000}
+            return spec_out
+
+        # --------------- standard sampling path ---------------
         sample_kwargs = dict(self._sample_kwargs)
         if noise is not None:
-            noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
+            noise_t = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
+            if noise_t.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
+                noise_t = noise_t[None, ...]
+            sample_kwargs["noise"] = noise_t
 
-            if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
-                noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
-            sample_kwargs["noise"] = noise
-
-        observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
         outputs = {
             "state": inputs["state"],

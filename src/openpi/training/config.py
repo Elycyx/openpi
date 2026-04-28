@@ -1016,7 +1016,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotPiperDataConfig(
-            repo_id="/mnt/lx/cyx/openpi/datasets/stack_cubes",
+            repo_id="/home/fuxin/cyx/openpi/datasets/stack_cubes",
             base_config=DataConfig(prompt_from_task=True),
         ),
         batch_size=64,
@@ -1041,7 +1041,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotPiperDataConfig(
-            repo_id="/mnt/lx/cyx/openpi/datasets/piper_3in1",
+            repo_id="/home/fuxin/cyx/openpi/datasets/piper_3in1",
             base_config=DataConfig(prompt_from_task=True),
         ),
         batch_size=64,
